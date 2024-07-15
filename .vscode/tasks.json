@@ -1,0 +1,24 @@
+// .vscode/tasks.json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build_cuda",
+            "type": "shell",
+            "command": "/home/zeyu/cuda/bin/nvcc",
+            "args": [
+                "-o",
+                "${workspaceFolder}/tests/cuda/bin/test_cuda",
+                "-L/home/zeyu/nccl/build/lib",
+                "-lnccl",
+                "${workspaceFolder}/tests/cuda/src/test_cuda.cu",
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [],
+            "detail": "compiler_task"
+        }
+    ]
+}

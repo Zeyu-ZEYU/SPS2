@@ -1,0 +1,245 @@
+#include <torch/extension.h>
+#include <assert.h>
+#include <cuda.h>
+#include <mma.h>
+#include <stdio.h>
+
+#include "helper_cuda.h"
+
+// Set this to 0 to use more than 64 KB of shared memory to cache data, to
+// improve the performance of the computations on GPU.
+// Note that you need a GPU that can have more than 64 KB of shared memory
+// per multiprocessor when setting it to 0.
+#define SHARED_MEMORY_LIMIT_64K 0
+
+#define WARP_SIZE 32
+
+#define M_TILE 16
+#define N_TILE 16
+#define K_TILE 16
+
+#define WARPS_PER_BLOCK 8
+#define THREADS_PER_BLOCK (WARP_SIZE * WARPS_PER_BLOCK)
+
+#define BLOCK_ROW_WARPS 2
+#define BLOCK_COL_WARPS 4
+
+#define WARP_ROW_TILES 4
+#define WARP_COL_TILES 2
+
+#define BLOCK_ROW_TILES (WARP_ROW_TILES * BLOCK_ROW_WARPS)
+#define BLOCK_COL_TILES (WARP_COL_TILES * BLOCK_COL_WARPS)
+
+// i.e., the number of colums (the memory pattern is row-major)
+#define BLOCK_ROW_LEN (BLOCK_ROW_TILES * N_TILE)
+// i.e., the number of rows (the memory pattern is row-major)
+#define BLOCK_COL_LEN (BLOCK_COL_TILES * M_TILE)
+
+#define SHMEM_STRIDE_C (BLOCK_ROW_TILES * N_TILE)
+#define SHMEM_OFFSET_C (WARP_ROW_TILES * N_TILE)
+
+#define checkKernelErrors(expr)                                   \
+    do                                                            \
+    {                                                             \
+        expr;                                                     \
+                                                                  \
+        cudaError_t __err = cudaGetLastError();                   \
+        if (__err != cudaSuccess)                                 \
+        {                                                         \
+            printf("Line %d: '%s' failed: %s\n", __LINE__, #expr, \
+                   cudaGetErrorString(__err));                    \
+            abort();                                              \
+        }                                                         \
+    } while (0)
+
+using namespace nvcuda;
+
+__global__ void bmm_half_kernel(const at::Half *A_at_Half, const at::Half *B_at_Half, at::Half *C_at_Half,
+                                int batch_size, int M, int N, int K, int K_CHUNK_TILES, int K_TILE_CHUNK_PADDED_LEN)
+{
+    const half *A = reinterpret_cast<const half *>(A_at_Half);
+    const half *B = reinterpret_cast<const half *>(B_at_Half);
+    half *C = reinterpret_cast<half *>(C_at_Half);
+
+    extern __shared__ half shmem[][K_TILE_CHUNK_PADDED_LEN];
+    int4 zero_mem = make_int4(0, 0, 0, 0);
+
+    // Warp and lane identification.
+    const unsigned int warpId = threadIdx.x / WARP_SIZE;
+    const unsigned int warpThreadId = threadIdx.x % WARP_SIZE;
+
+    // Offset in shared memory from which the B matrix is stored.
+    const size_t shmem_idx_b_off = BLOCK_COL_LEN;
+
+    // This pointer is used to access the C matrix tiles this warp computes.
+    float *shmem_ptr_c_warp = (float *)&shmem[0][0] +
+                              (warpId / BLOCK_ROW_WARPS) * SHMEM_STRIDE_C * N_TILE * WARP_COL_TILES +
+                              (warpId % 2) * SHMEM_OFFSET_C;
+    // This pointer is used to stream transfer a C matrix row partition by a warp.
+    float *shmem_ptr_c_stream_transfer_by_warp =
+        (float *)&shmem[0][0] + warpId * SHMEM_STRIDE_C * N_TILE;
+
+    // Get the indices of the current block in the C matrix.
+    size_t blk_glob_c_idx_i;
+    size_t blk_glob_c_idx_j;
+    unsigned int block_id = blockIdx.x;
+    unsigned int num_blocks = gridDim.x;
+    unsigned int max_col_blocks_per_batch = (M + BLOCK_COL_LEN - 1) / BLOCK_COL_LEN;
+    unsigned int max_row_blocks = (N + BLOCK_ROW_LEN - 1) / BLOCK_ROW_LEN;
+    blk_glob_c_idx_i = block_id / max_row_blocks * BLOCK_COL_LEN -
+                       (block_id / max_row_blocks / max_col_blocks_per_batch) *
+                           (max_col_blocks_per_batch * BLOCK_COL_LEN - M);
+    blk_glob_c_idx_j = block_id % max_row_blocks * BLOCK_ROW_LEN;
+    int exceed_col_boundry = (block_id / max_row_blocks + 1) == max_col_blocks_per_batch &&
+                                     max_col_blocks_per_batch * BLOCK_COL_LEN != M
+                                 ? 1
+                                 : 0;
+    int exceed_row_boundry = (block_id % max_row_blocks + 1) == max_row_blocks &&
+                                     max_row_blocks * BLOCK_ROW_LEN != N
+                                 ? 1
+                                 : 0;
+    size_t glob_c_col_len = batch_size * M;
+    while (blk_glob_c_idx_i < glob_c_col_len)
+    {
+        // These fragments will accumulate the result of A and B matrix fragment
+        // multiplications along the K_GLOBAL dimension.
+        wmma::fragment<wmma::accumulator, M, N, K, float> acc_frag[WARP_COL_TILES]
+                                                                  [WARP_ROW_TILES];
+
+        // Select what warp copies what matrix to shared memory.
+        // Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
+        const half *warp_gmem_ab_ptr = (warpId < (WARPS_PER_BLOCK / 2)) ? (&A[blk_glob_c_idx_i * K] +
+                                                                           M_TILE * K * warpId * 2)
+                                                                        : (&B[blk_glob_c_idx_j * K] +
+                                                                           N_TILE * K * (warpId - (WARPS_PER_BLOCK / 2)) * 2);
+
+        // Go through the global K dimension by a fixed step at a time.
+        assert(K / K_TILE == 8);
+        int actual_copy_lines = 0;
+        if (warpId < (WARPS_PER_BLOCK / 2))
+        {
+            if (exceed_col_boundry)
+            {
+                int block_exceeded_lines = max_col_blocks_per_batch * BLOCK_COL_LEN - M;
+                if (warpId < (block_exceeded_lines - 1) / 32)
+                    actual_copy_lines = 32;
+                else if (warpId == (block_exceeded_lines - 1) / 32)
+                    actual_copy_lines = (block_exceeded_lines - 1) % 32 + 1;
+            }
+            else
+                actual_copy_lines = 32;
+        }
+        else
+        {
+            if (exceed_row_boundry)
+            {
+                int block_exceeded_lines = max_row_blocks * BLOCK_ROW_LEN - N;
+                if (warpId % 4 < (block_exceeded_lines - 1) / 32)
+                    actual_copy_lines = 32;
+                else if (warpId % 4 == (block_exceeded_lines - 1) / 32)
+                    actual_copy_lines = (block_exceeded_lines - 1) % 32 + 1;
+            }
+            else
+                actual_copy_lines = 32;
+        }
+#pragma unroll
+        for (int chunk_tile_k = 0; chunk_tile_k < 8; chunk_tile_k += K_CHUNK_TILES)
+        {
+            // Copy slices of the A and B matrices to shared memory.
+            // The first half of the warps in the CTA copy the A matrix, the rest copy
+            // the B matrix.
+            size_t shmem_idx =
+                (warpId < (WARPS_PER_BLOCK / 2))
+                    ? (M_TILE * warpId * 2)
+                    : (N_TILE * (warpId - (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off);
+
+            // First half of the warp copies the first row / column of the matrix,
+            // the second half of the warp copies the next.
+            int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K +
+                                      (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL) +
+                             (laneId % CHUNK_COPY_LINE_LANES);
+
+            // Shift the second half of the warp to the next row / column in the
+            // shared memory.
+            shmem_idx += laneId / CHUNK_COPY_LINE_LANES;
+        }
+
+        // Update the indices of the block in the C matrix.
+        block_id += num_blocks;
+        blk_glob_c_idx_i = block_id / max_row_blocks * BLOCK_COL_LEN -
+                           (block_id / max_row_blocks / max_col_blocks_per_batch) *
+                               (max_col_blocks_per_batch * BLOCK_COL_LEN - M);
+        blk_glob_c_idx_j = block_id % max_row_blocks * BLOCK_ROW_LEN;
+        exceed_col_boundry = (block_id / max_row_blocks + 1) == max_col_blocks_per_batch &&
+                                     max_col_blocks_per_batch * BLOCK_COL_LEN != M
+                                 ? 1
+                                 : 0;
+        exceed_row_boundry = (block_id % max_row_blocks + 1) == max_row_blocks &&
+                                     max_row_blocks * BLOCK_ROW_LEN != N
+                                 ? 1
+                                 : 0;
+    }
+}
+
+torch::Tensor bmm_half(torch::Tensor A, torch::Tensor B)
+{
+    // Assumption:
+    // A is in the shape of (batch_size, M, K)
+    // B is in the shape of (batch_size, N, K)
+    // This function is for the batched matrix multiplication: (batch_size, M, K) * (batch_size, K, N)
+    // The output is a matrix C in the shape of (batch_size, M, N)
+    // K is fixed to be 128
+    const auto batch_size = A.size(0);
+    const auto M = A.size(1);
+    const auto N = B.size(1);
+    const auto K = A.size(2);
+    assert(K == 128);
+
+    auto C = torch::zeros({batch_size, M, N}, torch::dtype(torch::kFloat16).device(torch::kCUDA));
+
+    // With only 64 KB shared memory available, we can fit two 8-tile chunks of
+    // the A and B matrix data, that are 16 * 16 * 8 * 8 * 2 = 32 KB each
+    // (i.e. two 8x8 arrays of tiles of 16x16 half-typed elements per CTA).
+    // But we cannot account the 8 KB total skew overhead, without which the
+    // performance would be severely impacted. So we choose to reduce the chunk size
+    // in half, i.e. the amount of A and B matrix data we cache in shared memory.
+    // Accordingly, this doubles the number of outer iterations across the global K
+    // dimension, which only slightly impacts the performance.
+    int K_CHUNK_TILES;
+    if (SHARED_MEMORY_LIMIT_64K == 1)
+        K_CHUNK_TILES = 4;
+    else
+        K_CHUNK_TILES = 8;
+
+    int K_TILE_CHUNK_LEN = K_CHUNK_TILES * K_TILE;
+
+    int SHMEM_PADDING_SKEW_HALF = 16;
+
+    int K_TILE_CHUNK_PADDED_LEN = K_TILE_CHUNK_LEN + SHMEM_PADDING_SKEW_HALF;
+
+    int DEVICE_ID = 0;
+    cudaDeviceProp deviceProp;
+    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, DEVICE_ID));
+
+    size_t SHMEM_SIZE_AB = sizeof(half) * (BLOCK_COL_LEN + BLOCK_ROW_LEN) * K_TILE_CHUNK_PADDED_LEN;
+    size_t SHMEM_SIZE_C = sizeof(float) * (BLOCK_COL_LEN * BLOCK_ROW_LEN);
+    size_t SHMEM_SIZE = MAX(SHMEM_SIZE_AB, SHMEM_SIZE_C);
+
+    // dim3 dimGrid(batch_size, (M + BLOCK_COL_LEN - 1) / BLOCK_COL_LEN, (N + BLOCK_ROW_LEN - 1) / BLOCK_ROW_LEN);
+    // dim3 dimBlock(THREADS_PER_BLOCK);
+
+    assert(deviceProp.sharedMemPerMultiprocessor >= SHMEM_SIZE);
+    checkCudaErrors(cudaFuncSetAttribute(bmm_half_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         SHMEM_SIZE));
+    checkKernelErrors((bmm_half_kernel<<<deviceProp.multiProcessorCount, THREADS_PER_BLOCK,
+                                         SHMEM_SIZE>>>(A.data_ptr<at::Half>(), B.data_ptr<at::Half>(),
+                                                       C.data_ptr<at::Half>(), batch_size, M, N, K,
+                                                       K_CHUNK_TILES, K_TILE_CHUNK_PADDED_LEN)));
+
+    return C;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, py_module)
+{
+    py_module.def("bmm_half", &bmm_half, "Matrix multiplication for half.");
+}
